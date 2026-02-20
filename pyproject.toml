@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gammaspec"
+version = "0.0.1"
+authors = [
+  { name="Marco Di Luzio", email="m.diluzio@inrim.it" },
+]
+description = "A small example package"
+readme = "README.md"
+requires-python = ">=3.13"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+license = "MIT"
+license-files = ["LICENSE*"]
+dependencies = [
+    "numpy>=1.20",
+    "pandas>=2.3.3",
+    "scipy>=1.16.3",
+    "matplotlib>=3.10.8",
+]
+
+
+[project.urls]
+Homepage = "https://github.com/..."
+#Issues = "https://github.com/..."
