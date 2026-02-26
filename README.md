@@ -1,3 +1,5 @@
+## Quick start
+
 Parsing of the csv LIST MODE files is already functional  
 
 from opening a python shell script in the folder gammaspec:  
