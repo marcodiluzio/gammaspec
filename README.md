@@ -2,7 +2,7 @@
 
 Parsing of the csv LIST MODE files is already functional  
 
-from opening a python shell script in the folder gammaspec:  
+from opening a python shell in the folder gammaspec:  
 ```python
 (Virtual Environment) PS C:\...\gammaspec\src\gammaspec> python
 ```
