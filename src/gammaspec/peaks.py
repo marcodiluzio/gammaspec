@@ -1,4 +1,4 @@
-"""Script to perform on gamma list mode spectrum
+"""Script to perform peak elaboration on gamma spectra
 
 description
 
@@ -13,7 +13,7 @@ This module can be imported into another script with:
 giving access to all its methods and classes
 
 author: Marco Di Luzio
-email: ...
+email: m.diluzio@inrim.it
 """
 
 
@@ -25,6 +25,7 @@ from scipy.optimize import curve_fit, OptimizeWarning
 from scipy.stats import norm, t, skewnorm, cauchy, lognorm, gamma
 from scipy.integrate import quad
 import spectra as gspec
+import automated_identification_photopeaks as aip
 
 warnings.simplefilter("error", OptimizeWarning)
 FWHMSIG = 1.665
@@ -51,7 +52,7 @@ def _SLOPE(x, mu, slop):
     return 1 + slop * (x-mu)
     
 def _CURVE(x, mu, a, b):
-    return 1 + a * (x-mu) + b * np.power(x-mu, 2)
+    return a * (x-mu) + b * np.power(x-mu, 2)
 
 def _STEP(x, A, mu, sigma, step):
     return A * step * norm.cdf(mu - x, scale=sigma)
@@ -535,11 +536,66 @@ class Elaboration:
             
     #####CONTINUE
     
+def mcmc_peak_search(counts, step=100, iterations=50000):
+    chain = []
+    
+    secdif = aip.second_diff(counts, 1, 5)
+    sd_secdif = aip.standard_dev_S(counts, 1, 5)
+    
+    filt = (secdif < 0) & (np.abs(secdif) > 2 * sd_secdif)
+    current = np.arange(0,len(counts))[filt]
+    print(current)
+    
+    counts = counts + 1
+    #current = np.arange(0 + step, len(counts), step)
+    #current = np.random.randint(0, len(counts), size=int(len(counts)/100))
+    #initial = current
+    #ame_state = 0
+    plt.plot(current, np.zeros(len(current)), 'ko')
+    for _ in range(iterations):
+        # Propose a new sample
+        #proposal = np.random.normal(current, 1).astype(int)
+        proposal = np.random.uniform(low=current - 1, high=current + 2).astype(int)
+        #proposal = int(np.random.uniform(low=current - 1, high=current + 2))
+        proposal = np.where(proposal < 0, 0, proposal)
+        proposal = np.where(proposal >= len(counts), len(counts)-1, proposal)
+        #if proposal < 0:
+        #    proposal = 0
+        #elif proposal > len(counts):
+        #    proposal = len(counts)
+
+        # Acceptance probability
+        acceptance_ratio = counts[proposal] / counts[current]
+
+        # Accept or reject the proposal
+        acceptance_value = np.random.rand(len(acceptance_ratio))#len(acceptance_ratio))
+        current = np.where(acceptance_value < acceptance_ratio, proposal, current)
+        #if acceptance_value < acceptance_ratio:
+        #    current = proposal
+
+        #chain.append(current)
+        #plt.plot(current, [_]*len(current), 'r-')
+
+    #print(current, initial, current - initial)
+    plt.plot(current, np.ones(len(current)), 'ro')
+    plt.show()
+        
+    return current
+    
 if __name__ == '__main__':
-    ccdf = gspec.ElaborationSpectrum('10_100_spectrum.asc', gspec.Calibration(), K=10)
+    #ccdf = gspec.ElaborationSpectrum('H:/code/gamma/elaboration/SDataR_Ho-166m_IRA_1_UG_2026-01-08_2026-02-25 12_14_27_EDT_25.asc', gspec.Calibration(), K=10)
+    pass
+    #peaks = mcmc_peak_search(ccdf.counts)
+    #peaks = sorted(set(peaks))
+    #print(len(peaks))
+    #plt.plot(ccdf.counts, 'k-')
+    #plt.plot(peaks, ccdf.counts[peaks], 'ro')
+    #plt.show()
+    
     #css = ccdf._centroid_search([184])
     #ccdf.elaboration._add_region(css)
     #ccdf.elaboration.regions[0].elaboration_fit(ccdf.counts, Calibration().fwhm_params)
+    """
     reg = Region(6950, 7125, [7040])
     asyncio.run(reg.peak_elaboration(ccdf.counts, ccdf.elaboration.cal_fwhm))
     print(reg.fit)
@@ -561,4 +617,4 @@ if __name__ == '__main__':
         ax1.set_yscale('log')
         
         fig.tight_layout()
-        plt.show()
+        plt.show()"""

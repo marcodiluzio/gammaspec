@@ -3,7 +3,7 @@
 description
 
 it contains functions:
-open_digitized_spectrum, openASCfile
+open_digitized_spectrum, openASCfile, get_spectra_filenames, spectrum_multielab, multi_spectrum_elab
 
 it contains classes:
 GammaSpectrum, SpectrumChunk, ElaborationSpectrum
@@ -13,7 +13,7 @@ This module can be imported into another script with:
 giving access to all its methods and classes
 
 author: Marco Di Luzio
-email: ...
+email: m.diluzio@inrim.it
 """
 
 #imports
@@ -36,7 +36,7 @@ class Calibration:
         self.fwhm_params = np.array([0.015, 220])
 
 
-class GammaSpectrum:#consider also loss-free counting (LFC)
+class GammaSpectrum:
     """Class for reconstructed gamma spectrum
     
     Attributes
@@ -146,6 +146,17 @@ class GammaSpectrum:#consider also loss-free counting (LFC)
         return GammaSpectrum(real_time, live_time, counts, real_time_unc, live_time_unc, len(counts), chunk_info_sum)
         
     def _get_chunks_info(self):
+        """Aggregate spectrum information from every chunks
+        
+        Parameters
+        ----------
+        None
+            
+        Return
+        ------
+        spectrum_info : pandas.DataFrame
+            DataFrame created from self.chunk_info list including relevant chunks information
+        """
         return pd.concat(self.chunk_info, axis=1).T
         
     def defined_spectrum_integral(self, start=0, end=None):
@@ -342,9 +353,9 @@ class SpectrumChunk(GammaSpectrum):#non-overlapping spectrum chunks, #consider a
         self.real_time, self.live_time, self.real_time_unc, self.live_time_unc = self._count_counting_time(unc=unc_trigger)
         self.counts = self._count_counts()
         
-        #HERE THE THING
+        #Loss-Free Count mode
         if LFC:
-            self.counts = self.counts * self.real_time / self.live_time
+            self.counts = self.counts * self.real_time / self.live_time # exceptionally allowing an array of floats for self.counts
             self.live_time = self.real_time
             self.live_time_unc = np.sqrt(np.power(self.live_time_unc,2) + np.power(self.real_time_unc,2))
         
@@ -375,7 +386,7 @@ class SpectrumChunk(GammaSpectrum):#non-overlapping spectrum chunks, #consider a
         extended_dead_time_signal_sequence : list
             list of 4-items tuple for triggers (time, time + extended dead time, energy, flag)
         """
-        return [(row[0], row[0] + dead_time, row[1], row[2]) for row in signal_sequence]#if row[2] not in ()
+        return [(row[0], row[0] + dead_time, row[1], row[2]) for row in signal_sequence]
         
     def _add_deadtime_to_trigger_flagsaware(self, signal_sequence, _gate_close):
         """create couples (start_time, end_time) for triggers of gates where start_time and end_time are identified by their corresponding flags
@@ -392,8 +403,8 @@ class SpectrumChunk(GammaSpectrum):#non-overlapping spectrum chunks, #consider a
         gatetimes : list
             list of 2-items tuple for triggers (time start dead time, time end dead time)
         """
-        start_id = ('0x400', '0xc00')#WATCH HERE!!!
-        end_id = ('0x0', '0x800')
+        start_id = ('0x400', '0xc00')#flags for gate closed
+        end_id = ('0x0', '0x800')#flags for gate open
         
         gatetimes = []
         
@@ -422,11 +433,13 @@ class SpectrumChunk(GammaSpectrum):#non-overlapping spectrum chunks, #consider a
                     previous = None
 
                 elif line[1] in start_id and previous is not None:
-                    #print('double start situation')#what to do here? disregard? open a different thread?
-                    previous = line[0]
+                    #'double start situation' -> disregard
+                    #previous = line[0]
+                    #'double start situation' -> extend dead time
+                    pass
                     
                 elif line[1] in end_id and previous is None:
-                    pass#print('end without start situation')#what to do here? disregard? open a different thread?
+                    pass
                     
                 else:
                     print('ERROR!')
@@ -435,22 +448,52 @@ class SpectrumChunk(GammaSpectrum):#non-overlapping spectrum chunks, #consider a
 
         return gatetimes
         
-    def _add_deadtime_to_trigger_regardless_of_flag(signal_sequence, dead_time):
-        """create couples (start-time, end-time) for triggers of gates where end-time is start-time + some fixed time
+    def _add_deadtime_to_trigger_unaware(self, signal_sequence, _gate_close):
+        """create couples (start-time, end-time) for triggers of gates where start-time and end-time are consecutive triggers
         
         Parameters
         ----------
         signal_sequence : list
             list of 3-items tuple for triggers (time, energy, flag)
-        dead_time : int
-            extended dead time to apply to gate times, in femtoseconds
+        _gate_close : bool
+            whether the previous spectrum chunk ended with gate closed (dead time) or open
             
         Return
         ------
         gatetimes : list
             list of 2-items tuple for triggers (time start dead time, time end dead time)
         """
-        return [(row[0], row[0] + dead_time) for row in signal_sequence]
+        
+        gatetimes = []
+        
+        if _gate_close:
+            previous = self.start
+        else:
+            previous = None
+            
+        idx = 0
+        while True:
+            try:
+                line = signal_sequence[idx]
+            except IndexError:
+                if previous is not None:
+                    closure = np.max([self.deadtimes[-1][1], previous + 1])
+                    gatetimes.append((previous, closure))
+                break
+            else:
+                if previous is None:
+                    previous = line[0]
+                    
+                elif previous is not None:
+                    gatetimes.append((previous, line[0]))
+                    previous = None
+
+                else:
+                    print('ERROR!')
+                    
+                idx += 1
+
+        return gatetimes
         
     def _count_counting_time(self, unc=1):
         """create couples (start_time, end_time) for triggers of gates where end_time = start_time + some_fixed_time
@@ -541,7 +584,7 @@ class SpectrumChunk(GammaSpectrum):#non-overlapping spectrum chunks, #consider a
         self.deadtimes = [row for row in self.deadtimes if row is not None]
         
     def _add_deadtime_to_trigger_selection(self, signal_sequence, dead_time):
-        """extend the dead time for not rejected triggers
+        """extend the dead time for non-rejected triggers
         
         Parameters
         ----------
@@ -599,10 +642,6 @@ class SpectrumChunk(GammaSpectrum):#non-overlapping spectrum chunks, #consider a
 
                     #aggregation
                     self.gatetimes[_idx] = (self.gatetimes[_idx][0], self.gatetimes[_edx][1])#extended deadtime
-                    #the second one
-                    #self.gatetimes[_idx] = (self.gatetimes[_idx][0], self.gatetimes[_idx][1])
-                    #consider the second as the closing gate trigger
-                    #self.gatetimes[_idx] = (self.gatetimes[_idx][0], self.gatetimes[_edx][0])
 
                     #deletion
                     for _sweepidx in range(1, _edx - _idx + 1, 1):
@@ -671,8 +710,10 @@ class SpectrumChunk(GammaSpectrum):#non-overlapping spectrum chunks, #consider a
             list of 2-item tuples indicating start and end periods of the dead time
         """
         
+        #still if neglect the signal at the extremes of the spectrum: 0 and -1 indexes
         off_scale = ()#'0x80', '0x400', '0x8000', '0xc00' '0x8800', '0x800', '0x880', '0x480')
-
+        
+        #check for everlapping triggers with previous chunk
         i1, i2 = 0, 0
 
         while True:
@@ -692,7 +733,8 @@ class SpectrumChunk(GammaSpectrum):#non-overlapping spectrum chunks, #consider a
                     break
             except IndexError:
                 break
-
+                
+        #solve overlaps
         #i1 and i2 separetely
         if i1 > 0 and i2 == 0:
             endpoint = self.deadtimes[i1-1][1]
@@ -733,11 +775,11 @@ class SpectrumChunk(GammaSpectrum):#non-overlapping spectrum chunks, #consider a
                 self.gatetimes = [(_previous_endpoint, endpoint)] + self.gatetimes
             elif _previous_endpoint < endpoint and _intersect:
                 self.gatetimes[0] = (_previous_endpoint, self.gatetimes[0][1])
-
+                
+        #manage triggers and gates
         shuffled = []
         trigger = []
         i1, i2 = 0, 0
-        #shuffled list might be unordered but it's not an issue as only the sum of differences is needed from now on
 
         while True:
             try:
@@ -791,7 +833,8 @@ class SpectrumChunk(GammaSpectrum):#non-overlapping spectrum chunks, #consider a
             else:
                 #something failed
                 raise NotImplementedError(f'unexpected condition encountered in loop\nTRIG: {aa[0]}, {aa[1]}\nGATE: {bb[0]}, {bb[1]}')
-
+                
+        #shuffled list might be unordered but it's not an issue as only the sum of differences is needed from now on
         return trigger, shuffled
 
 
@@ -801,7 +844,7 @@ class ElaborationSpectrum(GammaSpectrum):
     
     Attributes
     ----------
-    self.elaboration : pk_elaboration.Elaboration
+    self.elaboration : peaks.Elaboration
         stores the elaboration of peaks
     self.elaboration_date : datetime ?
         descr
@@ -945,7 +988,7 @@ class ElaborationSpectrum(GammaSpectrum):
         
         Return
         ------
-        elaboration : pk_elab.Elaboration
+        elaboration : peaks.Elaboration
             elaboration object
         """
         #just for test
@@ -1092,7 +1135,7 @@ def open_digitized_spectrum(filename, chunksize=100000, channel_signal=0, channe
         spectrum.counts = np.round(spectrum.counts).astype(int)
     return spectrum
 
-def spectrum_multielab(filename, extended_deadtimes, n_channels, chunksize=250000, folder='elaboration', verbose=True, LFC=False):
+def spectrum_multielab(filename, extended_deadtimes, n_channels, chunksize=250000, folder='elaboration', verbose=True, LFC=False, full_output=True):
     """Elaboration of the same list mode spectrum with multiple extended dead times
     
     Parameters
@@ -1111,6 +1154,8 @@ def spectrum_multielab(filename, extended_deadtimes, n_channels, chunksize=25000
         descr (default True)
     LFC : bool
         whether perform elaboration in loss-free counts method, useful for spectra with rapidly changing dead times (default False)
+    full_output : bool
+        whether save also a csv summary of the chunk's information (default True)
     
     Return
     ------
@@ -1125,29 +1170,31 @@ def spectrum_multielab(filename, extended_deadtimes, n_channels, chunksize=25000
         path, file_name = os.path.split(filename)
         fname, extension = os.path.splitext(file_name)
         
-        spectrum._save(os.path.join(folder, fname))
+        spectrum._save(os.path.join(folder, fname), full=full_output)
         
         print(f'EXTENDED DEAD TIME {EXTENDED_DEADTIME} μs COMPLETED!')
         
-def multi_spectrum_elab(filenames, extended_deadtimes, n_channels, chunksize=250000, folder='elaboration', verbose=True, LFC=False):#CHECK THIS OUT
+def multi_spectrum_elab(filenames, extended_deadtimes, n_channels, chunksize=250000, folder='elaboration', verbose=True, LFC=False, full_output=True):
     """Elaboration of the same list mode spectrum with multiple extended dead times
     
     Parameters
     ----------
     filenames : list
-        name of the gamma spectrum in list mode file
+        list of names for the gamma spectra in list mode file
     extended_deadtimes : list
         list of floats indicating extended dead times in μs to feed the elaboration
     n_channels : int
-        number of channels in the spectrum
+        number of channels in the spectra, assumed to be the same for everyone
     chunksize : int
-        number of rows to elaborate at each iteration; useful for huge files (default 250000)
+        number of rows to elaborate at each iteration; useful for huge files and LFC (default 250000)
     folder : str (or Path)
         name of the folder where the output is saved (default 'elaboration')
     verbose : bool
         descr (default True)
     LFC : bool
-        whether perform elaboration in loss-free counts method, useful for spectra with rapidly changing dead times (default False)
+        whether perform elaboration in Loss-Free Counts method (LFC), useful for spectra with rapidly changing dead times (default False)
+    full_output : bool
+        whether save also a csv summary of the chunk's information (default True)
     
     Return
     ------
@@ -1155,10 +1202,30 @@ def multi_spectrum_elab(filenames, extended_deadtimes, n_channels, chunksize=250
     """
 
     for _file in filenames:
-        spectrum_multielab(extended_deadtimes)
-        print(f'FILE {_file} COMPLETED!')
+        try:
+            print(f'FILE ... {_file}')
+            spectrum_multielab(_file, extended_deadtimes, n_channels, chunksize=chunksize, folder=folder, verbose=verbose, LFC=LFC, full_output=full_output)
+            print(f'FILE {_file} COMPLETED!')
+        except IOError:
+            print('FILE ERROR')
+            
+def get_spectra_filenames(data_folder):
+    """Get spectra names from folder
+    
+    Parameters
+    ----------
+    data_folder : str (Path)
+        folder where gamma spectra are found
+    
+    Return
+    ------
+    filenames : list
+        filenames of .csv files in data_folder
+    """
+    return [os.path.join(data_folder, filename) for filename in os.listdir(data_folder) if filename.lower().endswith('.csv') and os.path.isfile(os.path.join(data_folder, filename))]
 
 def display_results(folder='test'):
+    #experimental
     #folder = 'test'
     flist = os.listdir(folder)
     edt_set = sorted(set([int(fname.split('_')[1]) for fname in flist]))
@@ -1281,17 +1348,18 @@ def display_results(folder='test'):
     
     plt.show()
 
-filename = 'gamma/SDataR_Ho-166m_IRA_1_UG_2026-01-08.csv'
-
-CHUNKSIZE = 50000
-EXTENDED_DEADTIMES = (5, 10, 25, 50, 75, 100, 125, 150, 175, 200)
-EXTENDED_DEADTIMES = (5,) # 5 μs is basically almost no dead time
-N_CHANNELS = 16384
 
 if __name__ == '__main__':
-    #pass
-    spectrum_multielab(filename, EXTENDED_DEADTIMES, N_CHANNELS, chunksize=CHUNKSIZE, LFC=True)
-    
+    data_folder = 'H:/code/gamma'
+    CHUNKSIZE = 50000
+    EXTENDED_DEADTIMES = (5, 10, 25, 50, 75, 100, 125, 150, 175, 200)
+    #EXTENDED_DEADTIMES = (5,) # 5 μs is basically almost no dead time
+    N_CHANNELS = 16384
+    LossFreeCounts = True
+    full_output = True
+    #spectrum_multielab(filename, EXTENDED_DEADTIMES, N_CHANNELS, chunksize=CHUNKSIZE, verbose=True, LFC=False, folder='H:/code/gamma/elaboration')
+    filenames = get_spectra_filenames(data_folder)
+    multi_spectrum_elab(filenames, EXTENDED_DEADTIMES, N_CHANNELS, chunksize=CHUNKSIZE, verbose=True, LFC=LossFreeCounts, folder=os.path.join(data_folder, 'elaboration'), full_output=full_output)
     """
 
     ccdf = ElaborationSpectrum('10_100_spectrum.asc', Calibration(), K=10)
