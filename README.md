@@ -12,7 +12,7 @@ import spectra
 
 #settings
 CHUNKSIZE = 50000         # size of every chunk in lines
-EXTENDED_DEADTIMES = (5,) # list of extended dead times in ms
+EXTENDED_DEADTIMES = (5,) # list of extended dead times in µs
 N_CHANNELS = 16384        # number of channel of the resulting spectrum
 LossFreeCounts = False    # whether to perform a Loss-Free Counts correction at every chunk
 full_output = True        # whether to return an additional csv output with comprehensive information of every chunk
