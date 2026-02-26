@@ -21,7 +21,7 @@ full_output = True        # whether to return an additional csv output with comp
 
 #elaboration on a single file
 filename = 'C:/.../gamma/SDataR_Ho-166m_IRA_1_UG_2026-01-08.csv'
-spectra.spectrum_multielab(filename, EXTENDED_DEADTIMES, N_CHANNELS, chunksize=CHUNKSIZE, verbose=True, LFC=False, folder='C:/.../gamma/elaboration')
+spectra.spectrum_multielab(filename, EXTENDED_DEADTIMES, N_CHANNELS, chunksize=CHUNKSIZE, verbose=True, LFC=False, folder='C:/.../gamma/elaboration', full_output=full_output)
 
 #multiple files at once
 data_folder = 'C:/.../gamma'
