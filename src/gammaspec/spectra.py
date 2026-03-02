@@ -1206,7 +1206,7 @@ def multi_spectrum_elab(filenames, extended_deadtimes, n_channels, chunksize=250
             print(f'FILE ... {_file}')
             spectrum_multielab(_file, extended_deadtimes, n_channels, chunksize=chunksize, folder=folder, verbose=verbose, LFC=LFC, full_output=full_output)
             print(f'FILE {_file} COMPLETED!')
-        except IOError:
+        except (IOError, pd.errors.ParserError):
             print('FILE ERROR')
             
 def get_spectra_filenames(data_folder):
