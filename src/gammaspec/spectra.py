@@ -850,7 +850,7 @@ class SpectrumChunkFPGA(GammaSpectrum):#non-overlapping spectrum chunks, #consid
     _add_deadtime_to_trigger()
         descr
     """
-    def __init__(self, trigger_dataframe, _previous_endpoint, ADC_conv=256, unc_trigger=1, channels=16384, LFC=False, LFC_type='ICR'):
+    def __init__(self, trigger_dataframe, _previous_endpoint, extended_deadtime, ADC_conv=256, unc_trigger=1, channels=16384, LFC=False, LFC_type='ICR'):
         """SpectrumChunkPHA class constructor
 
         Parameters
@@ -859,6 +859,8 @@ class SpectrumChunkFPGA(GammaSpectrum):#non-overlapping spectrum chunks, #consid
             list of 3-items tuple for triggers (time, energy, flag)
         _previous_endpoint : int
             timestamp indicating the endpoint of the previous chunk
+        extended_deadtime : float
+            extended dead time to apply to triggers, in microseconds
         unc_trigger : float
             uncertainty of each timespan in microseconds (default 1)
         channels : int
@@ -878,6 +880,7 @@ class SpectrumChunkFPGA(GammaSpectrum):#non-overlapping spectrum chunks, #consid
         super().__init__(channels=channels)
         #conversion of times from micro to picoseconds
 
+        extended_deadtime = int(extended_deadtime * 1E6)
         self.start = _previous_endpoint
         self.deadtimes = trigger_dataframe
         self.exclude = trigger_dataframe['CHARGE'] < 0
@@ -1966,7 +1969,7 @@ def open_digitized_spectrumFPGA(filename, chunksize=100000, channel_signal=None,
 
         for chunk in spectrum_file:
 
-            local_ch = SpectrumChunkFPGA(chunk, _previous_endpoint, ADC_conv=ADC_conv, unc_trigger=unc_trigger, channels=spectrum.channels, LFC=LFC, LFC_type=LFC_type)
+            local_ch = SpectrumChunkFPGA(chunk, _previous_endpoint, extended_deadtime, ADC_conv=ADC_conv, unc_trigger=unc_trigger, channels=spectrum.channels, LFC=LFC, LFC_type=LFC_type)
 
             _previous_endpoint = local_ch.end
             #add chunk's information to the total spectrum
