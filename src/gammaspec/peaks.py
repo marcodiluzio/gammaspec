@@ -3,10 +3,10 @@
 description
 
 it contains functions:
--
+_peak_integral, _get_fit, _manage_fit
 
 it contains classes:
-PeakFit, Region, Elaboration
+-
 
 This module can be imported into another script with:
 "from gammaspec import peaks"
@@ -16,19 +16,462 @@ author: Marco Di Luzio
 email: m.diluzio@inrim.it
 """
 
-
+import os
+import pickle
+import datetime
 import numpy as np
-import matplotlib.pyplot as plt
-import asyncio
+import pandas as pd
+#import asyncio
 import warnings
 from scipy.optimize import curve_fit, OptimizeWarning
-from scipy.stats import norm, t, skewnorm, cauchy, lognorm, gamma
+from scipy.stats import norm, t, skewnorm, cauchy, lognorm, gamma, chi2, gennorm
 from scipy.integrate import quad
-import spectra as gspec
-import automated_identification_photopeaks as aip
 
 warnings.simplefilter("error", OptimizeWarning)
-FWHMSIG = 1.665
+FWHMSIG = 2.355
+
+class SpectrumElaboration:
+    def __init__(self, spectrum, regions=None, bkg=None):
+        self.spc = spectrum
+
+        #elaboration things
+        if regions is not None:
+            self.regions = regions
+        else:
+            self.regions = []
+        self.bkg = bkg
+        if self.bkg is not None and self.bkg.channels != self.spc.channels:
+            raise ValueError('spectrum and background need to have the same number of channels')
+
+    def _preserve(self):
+        preserve_name = os.path.splitext(self.spc.o_filename)[0]
+        elaborated = f'elaborated_{datetime.date.today().strftime("%Y-%m-%d")}'
+        with open(f'{preserve_name}_{elaborated}.pel', 'wb') as pfile:
+            pickle.dump(self, pfile)
+
+    def _add_region(self):
+        pass
+
+    def _adjust_bkg(self):
+        if self.bkg is None:
+            return np.zeros(self.spc.channels)
+
+        return np.array(self.bkg.counts/self.bkg.live_time*self.spc.live_time, dtype=int)
+
+    def _elab_region(self):
+        #init
+        centroid_lst = []
+        energy_lst = []
+        area_lst = []
+        area_unc_lst = []
+        fwhm_lst = []
+        fwhm_unc_lst = []
+        activity_lst = []
+        activity_unc_lst = []
+        isoptope_ref = []
+        infos = []
+        for reg in self.regions:
+            BKG_counts = self._adjust_bkg()
+            X, Y, _ = reg.spectrum_slice(self.spc.counts, BKG_counts)
+
+            try:
+                Yvar = self.spc.var[X] + BKG_counts[X]
+            except (TypeError, IndexError):
+                Yvar = None
+
+            popt, pcov = _manage_fit(X, Y, _, reg.func, Y2=Yvar)
+
+            perr = np.sqrt(np.diag(pcov))
+            spcICR, uspcICR = self.spc.input_count_rate()
+
+            if popt[0] is not None:
+
+                #prepare for output
+                centroid_lst.append(popt[1])
+                energy_lst.append(reg.energy)
+                area_lst.append(popt[0])
+                area_unc_lst.append(perr[0])
+                fwhm_lst.append(popt[2] * FWHMSIG)
+                fwhm_unc_lst.append(perr[2] * FWHMSIG)
+                activity_lst.append(reg.activity)
+                activity_unc_lst.append(reg.activity_unc)
+                isoptope_ref.append(reg.ilabel)
+                infos.append((popt, pcov, reg.func, self.spc.live_time, self.spc.live_time_unc, self.spc.real_time, self.spc.real_time_unc, spcICR, uspcICR))
+
+        return centroid_lst, energy_lst, area_lst, area_unc_lst, fwhm_lst, fwhm_unc_lst, activity_lst, activity_unc_lst, isoptope_ref, infos
+
+
+class CalibrationsProcedure:
+    def __init__(self, spectrumelaboration_list):
+        self.sp_list = [item for item in spectrumelaboration_list if isinstance(item, SpectrumElaboration)]
+        self.centroid, self.energy, self.area, self.area_unc, self.fwhm, self.fwhm_unc, self.activity, self.activity_unc, self.isotope_ref, self.infos = self.elaborate()
+        self.pileup_corrected = False
+
+        self.E_calib = np.array([0, 1, 0])
+        self.E_calib_info = {'message':'default calibration'}
+
+        self.FWHM_calib = np.array([0, 1, 0])
+        self.FWHM_calib_info = {'message':'default calibration'}
+
+        self.EFF_calib = np.array([0, 1, 0])
+        self.EFF_calib_cov = np.identity(len(self.EFF_calib))
+        self.EFF_calib_info = {'message':'default calibration', 'fit':_poly_eff_fit, 'polyfit_n':4}
+
+    def elaborate(self):
+        centroid_lst, energy_lst, area_lst, area_unc_lst, fwhm_lst, fwhm_unc_lst, activity_lst, activity_unc_lst, isotope_ref, infos = [], [], [], [], [], [], [], [], [], []
+        for item in self.sp_list:
+            centroid_plt, energy_plt, area_plt, area_unc_plt, fwhm_plt, fwhm_unc_plt, activity_plt, activity_unc_plt, isotope_ref_plt, infos_plt = item._elab_region()
+
+            centroid_lst += centroid_plt
+            energy_lst += energy_plt
+            area_lst += area_plt
+            area_unc_lst += area_unc_plt
+            fwhm_lst += fwhm_plt
+            fwhm_unc_lst += fwhm_unc_plt
+            activity_lst += activity_plt
+            activity_unc_lst += activity_unc_plt
+            isotope_ref += isotope_ref_plt
+            infos += infos_plt
+
+        centroid_lst = np.array(centroid_lst, dtype=float)
+        energy_lst = np.array(energy_lst, dtype=float)
+        area_lst = np.array(area_lst, dtype=float)
+        area_unc_lst = np.array(area_unc_lst, dtype=float)
+        fwhm_lst = np.array(fwhm_lst, dtype=float)
+        fwhm_unc_lst = np.array(fwhm_unc_lst, dtype=float)
+        activity_lst = np.array(activity_lst, dtype=int)
+        activity_unc_lst = np.array(activity_unc_lst, dtype=int)
+        isotope_ref = np.array(isotope_ref, dtype=object)
+        infos = np.array(infos, dtype=object)
+
+        ord_index = np.argsort(centroid_lst)
+
+        return centroid_lst[ord_index], energy_lst[ord_index], area_lst[ord_index], area_unc_lst[ord_index], fwhm_lst[ord_index], fwhm_unc_lst[ord_index], activity_lst[ord_index], activity_unc_lst[ord_index], isotope_ref[ord_index], infos[ord_index]
+
+    def _pileup_correction(self, two_tau=0.0, two_tau_unc=0.0):
+        pup_corr_lst, upup_corr_lst = [], []
+        for item in self.infos:
+            spcICR, uspcICR = item[-2], item[-1]
+            pup_corr, upup_corr = evaluate_pileup_correction(spcICR, uspcICR, two_tau, two_tau_unc)
+            pup_corr_lst.append(pup_corr)
+            upup_corr_lst.append(upup_corr)
+
+        pup_corr_lst = np.array(pup_corr_lst, dtype=float)
+        upup_corr_lst = np.array(upup_corr_lst, dtype=float)
+
+        if not self.pileup_corrected:
+            urunc = self.area_unc / self.area
+            self.area = self.area * pup_corr_lst
+            self.area_unc = self.area * np.sqrt(np.power(urunc, 2) * np.power(upup_corr_lst/pup_corr_lst, 2))
+            self.pileup_corrected = True
+
+        return pup_corr_lst, upup_corr_lst
+
+    def _report(self):
+        pass
+
+    def _preserve(self, preserve_name='Calib_0'):
+        with open(f'{preserve_name}.pcb', 'wb') as pfile:
+            pickle.dump(self, pfile)
+
+    def eval_energy_calibration(self):
+        if len(self.centroid) < 4:
+            self.E_calib_info = {**self.E_calib_info, **{'message':'calibration error - not enough data points to perform calibration'}}
+            return
+
+        W = self.centroid[:,np.newaxis]**[_ for _ in range(3)]
+        self.E_calib = np.linalg.inv(W.T@W)@(W.T@self.energy)
+
+        WL = self.centroid[:,np.newaxis]**[_ for _ in range(2)]
+        parameters_linear = np.linalg.inv(WL.T@WL)@(WL.T@self.energy)
+
+        print(parameters_linear)
+
+        diff0 = (self.E_calib[0] - parameters_linear[0]) / parameters_linear[0]
+        diff1 = (self.E_calib[1] - parameters_linear[1]) / parameters_linear[1]
+        print(diff0, diff1)
+
+        self.E_calib_info = {**self.E_calib_info, **{'message':'E calibration succesful'}}
+
+    def eval_fwhm_calibration(self):
+        if len(self.centroid) < 4:
+            self.FWHM_calib_info = {**self.FWHM_calib_info, **{'message':'calibration error - not enough data points to perform calibration'}}
+            return None
+
+        #in channels convert to energy
+        Y, uY = self.fwhm*self.E_calib[1], self.fwhm_unc*self.E_calib[1]
+        Y = np.power(Y, 2)
+
+        W = self.energy[:,np.newaxis]**[_ for _ in range(3)]
+
+        self.FWHM_calib = np.linalg.inv(W.T@W)@(W.T@Y)
+        self.FWHM_calib_info = {**self.FWHM_calib_info, **{'message':'E calibration succesful'}}
+
+    def eval_efficiency_calibration(self):
+
+        def dataframe_helper(df, isotope_label, energy_label):
+            _filter_isotope = df['isotope'] == isotope_label
+            _filter_energy = df['energy / keV'] == energy_label
+
+            combined_filter = _filter_isotope & _filter_energy
+            sub_df = df[combined_filter]
+
+            return (sub_df.loc[sub_df.index[0], 'lambda / s'], sub_df.loc[sub_df.index[0], 'u_lambda / s'], sub_df.loc[sub_df.index[0], 'yield / 1'], sub_df.loc[sub_df.index[0], 'u_yield / 1'])
+
+        def uncertainty_evaluation_expg(activity, activity_unc, times, literature_data):
+
+            def _formula(pms):
+                return (pms[0] * pms[1] * pms[2] * (1 - np.exp(-pms[3] * pms[4]))) / (pms[3] * pms[4])
+
+            unc = []
+
+            for A, UA, TM, LDT in zip(activity, activity_unc, times, literature_data):
+                params = np.array([A, TM[0], LDT[2], LDT[0], TM[2]], dtype=float)
+                unc_p = np.array([UA, TM[1], LDT[3], LDT[1], TM[3]], dtype=float)
+                pcov = np.diag(np.power(unc_p,2))
+                sc = []
+
+                for idx, local_unc in enumerate(unc_p):
+                    mask = np.zeros(len(unc_p))
+                    mask[idx] = 1
+                    p_plus = params + unc_p * mask
+                    p_minus = params - unc_p * mask
+                    sc.append((_formula(p_plus) - _formula(p_minus)) / (2*local_unc + 1E-24))
+
+                sc = np.array(sc, dtype=float)
+                unc.append(np.sqrt((sc@pcov)@sc))
+
+            return np.array(unc, dtype=float)
+
+        if len(self.centroid) < 6:
+            return None
+
+        iso_db = load_isotope_database(short=False)
+        literature_data = np.array([dataframe_helper(iso_db, isotope_label, energy_label) for isotope_label, energy_label in zip(self.isotope_ref, self.energy)], dtype=float)
+
+        times = np.array([(info[3], info[4], info[5], info[6]) for info in self.infos], dtype=float)/1E12
+
+        expected_gammas = (self.activity * times.T[0] * literature_data.T[2] * (1-np.exp(-literature_data.T[0] * times.T[2]))) / (literature_data.T[0] * times.T[2])
+        expected_gammas_unc = uncertainty_evaluation_expg(self.activity, self.activity_unc, times, literature_data)
+
+        #efficiency
+        eps = self.area / expected_gammas
+        eps_unc = eps * np.sqrt(np.power(self.area_unc/self.area,2) + np.power(expected_gammas_unc/expected_gammas,2))
+
+        for EE, EPS, UEPS in zip(self.energy, eps, eps_unc):
+            print(EE, EPS, np.log(EPS), UEPS/EPS)
+
+        Y = np.log(eps)
+        uY = eps_unc / eps
+
+        #Y = eps
+        #uY = eps_unc
+
+        print(Y)
+        print(uY)
+
+        #V = np.identity(len(eps))
+        V = np.zeros((len(eps), len(eps)))
+        for idx0, isot0 in enumerate(self.isotope_ref):
+            for idx1, isot1 in enumerate(self.isotope_ref):
+                if isot0 == isot1:
+                    V[idx0, idx1] = 1 * uY[idx0] * uY[idx1]
+
+        #EM = self.energy / 1000
+        EM = np.log(self.energy)
+
+        #W = EM[:,np.newaxis]**[_ for _ in range(4)]
+        W = EM[:,np.newaxis]**[0, 1]#_ for _ in range(4)]
+        self.EFF_calib = np.linalg.inv(W.T@V@W)@(W.T@V@Y)
+        #parameters = np.linalg.inv(W.T@W)@(W.T@Y)#uncertainty here
+
+        #residuals
+        residuals = Y - self.EFF_calib@W.T
+
+        #covariance matrix
+        n, k = Y.shape[0], W.shape[1]
+        self.EFF_calib_cov = np.true_divide(1, n-k) * (residuals.T@V@residuals) * np.linalg.inv(W.T@V@W)
+        self.EFF_calib_info = {**self.EFF_calib_info, **{'message':'EFF calibration succesful'}}
+
+    def calibration(self, two_tau=0.0, two_tau_unc=0.0):
+
+        if not self.pileup_corrected and two_tau != 0:
+            self._pileup_correction(two_tau=two_tau, two_tau_unc=two_tau_unc)
+
+        self.eval_energy_calibration()
+        self.eval_fwhm_calibration()
+        self.eval_efficiency_calibration()
+
+
+class Region:
+    """Class to manage elaboration of region of interest in spectrum
+
+    Attributes
+    ----------
+    self.low : int
+        left hand side limit of ROI to consider
+    self.right : int
+        right hand side limit of ROI to consider
+    self.centroid : int
+        centroid of the peak
+
+    Methods
+    -------
+    _check_input()
+        assure correct input is provided to the class
+    spectrum_slice()
+        provide a slice for the array of the spectrum counts
+    """
+    def __init__(self, low_limit, high_limit, centroid=None):
+        """Region class constructor
+
+        Parameters
+        ----------
+        low_limit : int
+            left hand side limit of ROI to consider
+        high_limit : int
+            right hand side limit of ROI to consider
+        centroid : int
+            centroid of the peak (default None)
+
+        Return
+        ------
+        None
+        """
+        self.low, self.right, self.centroid = self._check_input(low_limit, high_limit, centroid)
+
+    def _check_input(self, low_limit, high_limit, centroid):
+        """Assure correct input is provided to the class
+
+        Parameters
+        ----------
+        low_limit : int
+            left hand side limit of ROI to consider
+        high_limit : int
+            right hand side limit of ROI to consider
+        centroid : int
+            centroid of the peak
+
+        Return
+        ------
+        low_limit : int
+            left hand side limit of ROI to consider
+        high_limit : int
+            right hand side limit of ROI to consider
+        centroid : int
+            centroid of the peak
+        """
+        if low_limit > high_limit - 10:
+            raise ValueError('Region should be at least 10 channel long')
+        if centroid is None:
+            centroid = low_limit + (high_limit - low_limit)/2
+        if centroid >= high_limit or centroid <= low_limit:
+            raise ValueError('Centroid outside region limits')
+        return int(low_limit), int(high_limit), int(centroid)
+
+    def spectrum_slice(self, counts, bkg_counts=None):
+        """Provide a slice for the array of the spectrum counts with consistent additional information
+
+        Parameters
+        ----------
+        counts : np.array
+            array of counts of the whole spectrum
+        bkg_counts : np.array (or None)
+            array of background counts to subtract to the spectrum [if None it defaults to an array of 0] (default None)
+
+        Return
+        ------
+        X : np.array
+            array of indices [number of channels] corresponding to the region of the spectrum to evaluate
+        Y : np.array
+            array of number of counts corresponding to X indices
+        centroid : int
+            centroid of the peak
+        """
+        X = np.arange(self.low, self.right, dtype=int)
+
+        if bkg_counts is None:
+            bkg_counts = np.zeros(len(counts))
+
+        try:
+            Y = counts[X] - bkg_counts[X]
+            np.maximum(Y, 0, out=Y)
+            Y = Y + 0.01
+        except IndexError:
+            return None, None, None
+        return X, Y, self.centroid
+
+
+class RegionElab(Region):
+    """Class to manage elaboration of region of interest in spectrum (inherits from Region)
+
+    Attributes
+    ----------
+    self.energy : np.array
+        array of float of the energy uncertainty for the corresponding data
+    self.activity : np.array
+        array of int of the activity for the corresponding data
+    self.activity_unc : np.array
+        array of int of the activity uncertainty for the corresponding data
+    self.ilabel : np.array
+        array of str label of the corresponding isotope
+    self._funcs : str
+        albel referring to the fitting curve to use
+    self.func : fitting_function
+        callable function, takes X and fitting parameters and return estimate of Y
+    self.funcBKG : fitting_function
+        callable function, takes X and fitting parameters and return estimate of the background within Y
+
+    Methods
+    -------
+    __repr__()
+        overwrite the default __repr__ function to show information about the region
+    """
+    def __init__(self, low_limit, high_limit, centroid, energy, activity, activity_unc, ilabel, lfuncs):
+        """RegionElab class constructor
+
+        Parameters
+        ----------
+        low_limit : int
+            left hand side limit of ROI to consider
+        high_limit : int
+            right hand side limit of ROI to consider
+        centroid : int
+            centroid of the peak
+        energy : float
+            energy of the emission in keV
+        activity : int
+            activity of the corresponding nuclide at the time of the acquisition in Bq
+        activity_unc : int
+            uncertianty of activity of the corresponding nuclide at the time of the acquisition in Bq
+        ilabel : str
+            label to identify the corresponding isotope
+        lfuncs : str
+            albel to identify the fitting funtion to use
+            valid options are:
+            'normal_step'       : gaussian function with stepped background
+            'normal_slope'      : gaussian function with sloped background
+            'normal_stepcurve'  : gaussian function with stepped background + background curve
+            'normal_slopecurve' : gaussian function with sloped background + background curve
+
+        Return
+        ------
+        None
+        """
+        super().__init__(low_limit, high_limit, centroid)
+        self.energy = energy
+        self.activity = activity
+        self.activity_unc = activity_unc
+        self.ilabel = ilabel
+        self._funcs = lfuncs
+        self.func, self.funcBKG = _get_fit(lfuncs)
+
+    def __repr__(self):
+        return f'({self.low} - {self.right}) -> {self.ilabel} @ {self.energy}'
+
+
+def _poly_eff_fit():
+    pass
 
 def _cauchy_fit(x, A, mu, sigma):
     return A * (cauchy.pdf(x, loc=mu, scale=sigma))
@@ -57,564 +500,276 @@ def _CURVE(x, mu, a, b):
 def _STEP(x, A, mu, sigma, step):
     return A * step * norm.cdf(mu - x, scale=sigma)
 
+def _fit_normal_step(x, A, mu, sigma, step, BKG):
+    #return A * (norm.pdf(x, loc=mu, scale=sigma)) + A * step * norm.cdf(mu - x, scale=sigma) + BKG
+    return A * (norm.pdf(x, loc=mu, scale=sigma) + step * norm.cdf(mu - x, scale=sigma)) + BKG
 
-class PeakFit:
-    """Class for base peak fit
-    
-    Attributes
+def _fit_normal_stepBKG(x, A, mu, sigma, step, BKG):
+    return A * step * norm.cdf(mu - x, scale=sigma) + BKG
+
+def _fit_normal_slope(x, A, mu, sigma, slop, BKG):
+    return A * (norm.pdf(x, loc=mu, scale=sigma)) + (1 + slop * (x-mu)) * BKG
+
+def _fit_normal_slopeBKG(x, A, mu, sigma, slop, BKG):
+    return (1 + slop * (x-mu)) * BKG
+
+def _fit_bothskews_step(x, A, mu, sigma, LStep, LScale, RStep, RScale, step, BKG):
+    return A * (norm.pdf(x, loc=mu, scale=sigma) + norm.pdf(x, loc=mu, scale=sigma) * LStep * norm.cdf((mu - x)/LScale, scale=sigma) + norm.pdf(x, loc=mu, scale=sigma) * RStep * norm.cdf((x - mu)/RScale, scale=sigma) + step * norm.cdf(mu - x, scale=sigma)) + BKG
+
+def _fit_bothskews_step_stepBKG(x, A, mu, sigma, LStep, LScale, RStep, RScale, step, BKG):
+    return A * step * norm.cdf(mu - x, scale=sigma) + BKG
+
+def _fit_normal_stepcurve(x, A, mu, sigma, step, a, b, BKG):
+    return A * ((norm.pdf(x, loc=mu, scale=sigma)) + step * norm.cdf(mu - x, scale=sigma)) + BKG + a * (x-mu) + b * np.power(x-mu, 2)
+
+def _fit_normal_stepcurveBKG(x, A, mu, sigma, step, a, b, BKG):
+    return A * step * norm.cdf(mu - x, scale=sigma) + BKG + a * (x-mu) + b * np.power(x-mu, 2)
+
+def _fit_normal_slopecurve(x, A, mu, sigma, slop, a, b, BKG):
+    return A * (norm.pdf(x, loc=mu, scale=sigma)) + (1 + slop * (x-mu)) * BKG + a * (x-mu) + b * np.power(x-mu, 2)
+
+def _fit_normal_slopecurveBKG(x, A, mu, sigma, slop, a, b, BKG):
+    return (1 + slop * (x-mu)) * BKG + a * (x-mu) + b * np.power(x-mu, 2)
+
+def _fit_gennorm(x, A, mu, sigma, mbeta, beta, step, BKG):
+    return A * (norm.pdf(x, loc=mu, scale=sigma) + mbeta * gennorm.pdf(x, beta, loc=mu, scale=1/np.sqrt(2)) + step * norm.cdf(mu - x, scale=sigma)) + BKG
+
+def _fit_gennormBKG(x, A, mu, sigma, mbeta, beta, step, BKG):
+    return A * step * norm.cdf(mu - x, scale=sigma) + BKG
+
+def _peak_integral(spectrum, cond_ROI, cond_BKG_CH):
+    """Peak area evaluation with the classic gross integral method
+
+    Parameters
     ----------
-    self.name : str
-        name identifying the peak fitting
-    self.P0 : list
-        descr
-    self.BOUNDS : list
-        descr
-    self._PEAK : list
-        descr
-    self._BACKGROUND : int
-        descr
-    self.coeff : np.array()
-        descr
-    self.var_matrix : np.array()
-        descr
-    
-    Methods
-    -------
-    __repr__()
-        descr
-    _fit()
-        descr
-    calculate_area()
-        descr
-    evaluate()
-        evaluate the fit
-    coro_evaluate()
-        coroutine wrapper for the evaluate function to improve performance
-    _draw_total()
-        draw total line (peaks + background), for plotting
-    _draw_partials()
-        draw peak lines, for plotting
-    _draw_background()
-        draw background line, for plotting
+    spectrum : spectra.GammaSpectrum
+        spectrum object
+    cond_ROI : tuple
+        2-item tuple indicating the limits of the ROI to calculate the integral
+    cond_BKG_CH : tuple
+        2-item tuple indicating the the number of channels (internal to the ROI) to calculate the integral on the background
+
+    Return
+    ------
+    peak_integral : float
+        net peak area
+    peak_uncertainty : float
+        uncertainty of net peak area
     """
-    def __init__(self, **kwargs):
-        self.name = 'Base Peak Fit'
-        self.P0 = []
-        self.BOUNDS = (None,None)
-        self._PEAK = [1]
-        self._BACKGROUND = 1
+    bkg_left = spectrum.defined_spectrum_integral(start=cond_ROI[0], end=cond_ROI[0]+cond_BKG_CH[0]) / cond_BKG_CH[0]
+    bkg_right = spectrum.defined_spectrum_integral(start=cond_ROI[1], end=cond_ROI[1]-cond_BKG_CH[1]) / cond_BKG_CH[1]
+    N = cond_ROI[1]-cond_BKG_CH[1] - (cond_ROI[0]+cond_BKG_CH[0])
+    g_peak = spectrum.defined_spectrum_integral(start=cond_ROI[0]+cond_BKG_CH[0], end=cond_ROI[1]-cond_BKG_CH[1])
+    c_peak = g_peak - np.average([bkg_left, bkg_right]) * N
+    ulin = np.sqrt(g_peak + np.average([bkg_left, bkg_right]) * N)
+    return c_peak, ulin/c_peak*100
 
-        self.coeff = [0]
-        self.var_matrix = [0]
-        self.centroids = [0]
-        self.u_centroids = [0]
-        self.peaks = [0]
-        self.ur_peaks = [0]
-        self.intmsg = -1
-        self.chisq = 9999
-        self.settings = {'max_chisq':kwargs.get('max_chisq', 10), 'bound_peak':kwargs.get('bound_peak', 2), 'bound_fwhm':kwargs.get('bound_fwhm', 2)}
-        #self._parameter_descriptor = ()#10
-        
-    def __repr__(self):
-        return f'{self.name}'
-        
-    def _fit(self, x, *p):
-        """placeholder"""
-        return None
-        
-    def calculate_area_and_centroids(self, X):
-        return np.array([0]), np.array([0]), np.array([0]), np.array([1])
-        
-    async def coro_evaluate(self, X, Y):
-        self.evaluate(X, Y)
-        return self
-        
-    def evaluate(self, X, Y):
-        try:
-            popt, pcov, moreinfo, mesg, alert = curve_fit(self._fit, X, Y, p0=self.P0, sigma=np.sqrt(Y), 
-                            bounds=self.BOUNDS, full_output=True,
-                            absolute_sigma=True)
-        except (ValueError, RuntimeError, RuntimeWarning, ValueError, OptimizeWarning) as error:
-            popt, pcov, moreinfo, mesg, alert = [0.0], [0.0], {}, '', -1
-        if alert in (1, 2, 3, 4):
-            self.coeff = popt
-            self.var_matrix = pcov
-            self.centroids, self.u_centroids, self.peaks, self.ur_peaks = self.calculate_area_and_centroids(X)            
-            res = Y - self._draw_total(X)
-            self.chisq = np.sum(np.power(res, 2)/Y) / (len(Y) - len(self.coeff))
+def _get_fit(fit_string):
+    """Get fit functions
 
-            #checks here or later? we'll see
-            if self.chisq < self.settings['max_chisq']:
-                self.intmsg = 0
-            else:
-                self.intmsg = 1
-        else:
-            self.intmsg = -1
-            
-    def _draw_total(self, x):
-        self._PEAK = [1] * len(self._PEAK)
-        self._BACKGROUND = 1
-        return self._fit(x, *self.coeff)
-    
-    def _draw_partials(self, x):
-        if len(self._PEAK) > 1:
-            self._BACKGROUND = 1
-
-            fits = []
-            for _idx in range(len(self._PEAK)):
-                self._PEAK = [0] * len(self._PEAK)
-                self._PEAK[_idx] = 1
-                fits.append(self._fit(x, *self.coeff))
-            return fits
-        return []
-
-    def _draw_background(self, x):
-        self._PEAK = [0] * len(self._PEAK)
-        self._BACKGROUND = 1
-        return self._fit(x, *self.coeff)
-        
-    def _calculate_peak_area(self, X):
-        self._PEAK = [0] * len(self._PEAK)
-        self._BACKGROUND = 0
-        peakareas = []
-        uncertainties = []
-        
-        for idx, npeak in enumerate(self.centroids):
-            self._PEAK[idx] = 1
-            area_calculation_results = quad(self._fit, np.min(X), np.max(X), args=tuple(self.coeff))
-            peakareas.append(area_calculation_results[0])
-            cs = []
-            copycoeff = np.copy(self.coeff)
-            for nn, value in enumerate(np.sqrt(np.diag(self.var_matrix))):
-                copycoeff[nn] = self.coeff[nn] + value
-                Psl = quad(self._fit, np.min(X), np.max(X), args=tuple(copycoeff))
-                copycoeff[nn] = self.coeff[nn] - value
-                Msl = quad(self._fit, np.min(X), np.max(X), args=tuple(copycoeff))
-                copycoeff[nn] = self.coeff[nn]
-                cs.append((Psl[0] - Msl[0])/(2 * value + 1E-24))
-            cs = np.array(cs)
-            uncertainties.append(np.sqrt((cs.T@self.var_matrix)@cs))
-            self._PEAK[idx] = 0
-        peakareas = np.array(peakareas)
-        rel_uncertainties = np.array(uncertainties) / peakareas
-        return peakareas, rel_uncertainties
-
-
-class StudentFit(PeakFit):
-    """Subclass of PeakFit
-    
-    Attributes
+    Parameters
     ----------
-    
-    Methods
-    -------
-    _fit()
-        overwrites the _fit() method of PeakFit
-    calculate_area_and_centroids()
-        overwrites the calculate_area_and_centroids() method of PeakFit
+    fit_string : str
+        string referring to a defined fit
+
+    Return
+    ------
+    peak_fitting_function : fitting_function
+        callable function, takes X and fitting parameters and return estimate of Y
+    background_fitting_function : fitting_function
+        callable function, takes X and fitting parameters and return estimate of the background within Y
     """
-    def __init__(self, Region, cal_fwhm, **kwargs):
-        super().__init__(**kwargs)
-        self.name = 't-1PEAK (), BKG ()'
-        
-        _cd = self.settings['bound_peak']
-        _fd = self.settings['bound_fwhm']
+    choice = {'normal_step' : (_fit_normal_step, _fit_normal_stepBKG),
+              'normal_slope' : (_fit_normal_slope, _fit_normal_slopeBKG),
+              'normal_stepcurve' : (_fit_normal_stepcurve, _fit_normal_stepcurveBKG),
+              'normal_slopecurve' : (_fit_normal_slopecurve, _fit_normal_slopecurveBKG),}
+    return choice.get(fit_string, (_fit_normal_step, _fit_normal_stepBKG))
 
-        FWHM1 = np.sqrt(Region.centroids[0] * cal_fwhm[0] + cal_fwhm[1])
-        self.P0 = [100, Region.centroids[0], FWHM1/FWHMSIG, 5, 1]        
-        self.BOUNDS = ((5, Region.centroids[0] - FWHM1/_cd, FWHM1/(_fd*FWHMSIG), 2, 0.01), (np.inf, Region.centroids[0] + FWHM1/_cd, FWHM1*_fd/FWHMSIG, np.inf, np.inf))
-        
-    def _fit(self, x, *p):
-        A, mu, sigma, df, BKG = p
-        return (_student_fit(x, A, mu, sigma, df)) * self._PEAK[0] + (_CONST_BKG(BKG)) * self._BACKGROUND
-        
-    def calculate_area_and_centroids(self, X):
-        uu = np.sqrt(np.diag(self.var_matrix))
-        return np.array(self.coeff[1:2], dtype=float), np.array(uu[1:2], dtype=float), np.array(self.coeff[0:1], dtype=float), np.array(uu[0:1]/self.coeff[0:1], dtype=float)
+def _fit_unc(_fit, X, popt, pcov):
+    """Calculate uncertainty of the Y estimate resulting from the fit using linearly approximated sensitivity coefficients
 
-
-class StudentFit_Step(PeakFit):
-    """Subclass of PeakFit
-    
-    Attributes
+    Parameters
     ----------
-    
-    Methods
-    -------
-    _fit()
-        overwrites the _fit() method of PeakFit
-    calculate_area_and_centroids()
-        overwrites the calculate_area_and_centroids() method of PeakFit
+    _fit : fitting_function
+        callable function, takes X and fitting parameters and return estimate of Y
+    X : np.array
+        array of indices [number of channels] corresponding to the region of the spectrum to evaluate
+    popt : np.array
+        array of the optimized parameters for the fit
+    pcov : np.array
+        2d-array corresponding to the covariance matrix
+
+    Return
+    ------
+    unc_fit : np.array
+        array of uncertainty for each x value in X
     """
-    def __init__(self, Region, cal_fwhm, **kwargs):
-        super().__init__(**kwargs)
-        self.name = 't-1PEAK (), BKG (ST)'
+    perr = np.sqrt(np.diag(pcov))
 
-        _cd = self.settings['bound_peak']
-        _fd = self.settings['bound_fwhm']
+    unc_fit = []
 
-        FWHM1 = np.sqrt(Region.centroids[0] * cal_fwhm[0] + cal_fwhm[1])
-        self.P0 = [100, Region.centroids[0], FWHM1/FWHMSIG, 5, 1, 0.01]        
-        self.BOUNDS = ((5, Region.centroids[0] - FWHM1/_cd, FWHM1/(_fd*FWHMSIG), 2, 0.01, 0), (np.inf, Region.centroids[0] + FWHM1/_cd, FWHM1*_fd/FWHMSIG, np.inf, np.inf, 1))
+    for x in X:
+        sc = []#sensitivity coefficients
+        for idx, local_unc in enumerate(perr):
+            mask = np.zeros(len(perr))
+            mask[idx] = 1
+            p_plus = popt + perr * mask
+            p_minus = popt - perr * mask
+            sc.append((_fit(x, *p_plus) - _fit(x, *p_minus)) / (2*local_unc + 1E-24))
+        sc = np.array(sc, dtype=float)
+        unc_fit.append(np.sqrt((sc@pcov)@sc))
 
-    def _fit(self, x, *p):
-        A, mu, sigma, df, BKG, step = p
-        return (_student_fit(x, A, mu, sigma, df)) * self._PEAK[0] + (_CONST_BKG(BKG) + _STEP(x, A, mu, sigma, step)) * self._BACKGROUND
-        
-    def calculate_area_and_centroids(self, X):
-        uu = np.sqrt(np.diag(self.var_matrix))
-        return np.array(self.coeff[1:2], dtype=float), np.array(uu[1:2], dtype=float), np.array(self.coeff[0:1], dtype=float), np.array(uu[0:1]/self.coeff[0:1], dtype=float)
+    return np.array(unc_fit, dtype=float)
 
+def _manage_fit(X, Y, centroid, s_fit, Y2=None):
+    """Perform non-linear peak fitting and manage input parameters
 
-class StudentFitRS_Step(PeakFit):
-    """Subclass of PeakFit
-    
-    Attributes
+    Parameters
     ----------
-    
-    Methods
-    -------
-    _fit()
-        overwrites the _fit() method of PeakFit
-    calculate_area_and_centroids()
-        overwrites the calculate_area_and_centroids() method of PeakFit
+    X : np.array
+        array of indices [number of channels] corresponding to the region of the spectrum to evaluate
+    Y : np.array
+        array of number of counts corresponding to X indices
+    centroid : int
+        centroid where the peak is suppposed to lie
+    s_fit : fitting_function
+        callable function, takes X and fitting parameters and return estimate of Y
+    Y2 : np.array (or None)
+        variance of Y, if None fallback to np.sqrt(Y) (default None)
+
+    Return
+    ------
+    popt : np.array
+        array of the optimized parameters for the fit
+    pcov : np.array
+        2d-array corresponding to the covariance matrix
     """
-    def __init__(self, Region, cal_fwhm, **kwargs):
-        super().__init__(*kwargs)
-        self.name = 't-1PEAK (RS), BKG (ST)'
 
-        _cd = self.settings['bound_peak']
-        _fd = self.settings['bound_fwhm']
+    try:
+        yunc = np.sqrt(Y2)
+    except (TypeError, ValueError):
+        yunc = np.sqrt(Y)
+    np.maximum(yunc, 1, out=yunc)
 
-        FWHM1 = np.sqrt(Region.centroids[0] * cal_fwhm[0] + cal_fwhm[1])
-        self.P0 = [100, Region.centroids[0], FWHM1/FWHMSIG, 5, 0.1, 1, 1, 0.01]        
-        self.BOUNDS = ((5, Region.centroids[0] - FWHM1/_cd, FWHM1/(_fd*FWHMSIG), 2, 0, 0.5, 0.01, 0), (np.inf, Region.centroids[0] + FWHM1/_cd, FWHM1*_fd/FWHMSIG, np.inf, 2, 1000, np.inf, 1))
+    if centroid >= np.max(X) or centroid <= np.min(X):
+        centroid = np.min(X) + (np.max(X) - np.min(X))//2
 
-    def _fit(self, x, *p):
-        A, mu, sigma, df, RStep, RScale, BKG, step = p
-        return (_student_fit(x, A, mu, sigma, df) + _rightskew(x, A, mu, sigma, RStep, RScale)) * self._PEAK[0] + (_CONST_BKG(BKG) + _STEP(x, A, mu, sigma, step)) * self._BACKGROUND
-        
-    def calculate_area_and_centroids(self, X):
-        uu = np.sqrt(np.diag(self.var_matrix))
-        peaks, ur_peaks = self._calculate_peak_area(X)
-        print('ANALYTIC', np.array([self.coeff[0]*(1 + self.coeff[4])], dtype=float), np.array([1], dtype=float))
-        print('NUMERIC', peaks, ur_peaks)
-        return np.array(self.coeff[1:2], dtype=float), np.array(uu[1:2], dtype=float), np.array(peaks, dtype=float), np.array(ur_peaks, dtype=float)
+    HALFWIDTH = (np.max(X) - np.min(X))/2
 
+    bound_choice = {_fit_normal_step : ([100, centroid, 3, 0.01, 10], ((10, centroid-3, 1, -np.inf, 0.01), (np.inf, centroid+3, HALFWIDTH, np.inf, np.inf))),
+                    _fit_normal_slope : ([100, centroid, 3, 0, 10], ((10, centroid-3, 1, -10, 0.01), (np.inf, centroid+3, HALFWIDTH, 10, np.inf))),
+                    _fit_normal_stepcurve : ([100, centroid, 3, 0.01, 0, 0, 10], ((10, centroid-3, 1, -np.inf, -np.inf, -np.inf, 0.01), (np.inf, centroid+3, HALFWIDTH, np.inf, np.inf, np.inf, np.inf))),
+                    _fit_normal_slopecurve : ([100, centroid, 3, 0, 0, 0, 10], ((10, centroid-3, 1, -np.inf, -100, -10, 0.01), (np.inf, centroid+3, HALFWIDTH, np.inf, 100, 10, np.inf))),
+                    }
 
-class StudentFitLS_Step(PeakFit):
-    """Subclass of PeakFit
-    
-    Attributes
+    P0, BOUNDS = bound_choice.get(s_fit, (None, None))
+
+    if P0 is None:
+        return [None, None, None, 0.0, 0.0], [1.0]
+
+    try:
+        popt, pcov, moreinfo, mesg, alert = curve_fit(s_fit, X, Y, p0=P0, sigma=yunc, bounds=BOUNDS, full_output=True, absolute_sigma=True)
+    except (ValueError, RuntimeError, RuntimeWarning, ValueError, OptimizeWarning) as error:
+        popt, pcov, moreinfo, mesg, alert = [None, None, None, 0.0, 0.0], [1.0], {}, '', ''
+    return popt, pcov
+
+def evaluate_pileup_correction(ICR, uICR, two_tau, utwo_tau):
+    """Calculate pileup correction factor based on input count rate and 2t parameter as exp(ICR * 2t)
+
+    Parameters
     ----------
-    
-    Methods
-    -------
-    _fit()
-        overwrites the _fit() method of PeakFit
-    calculate_area_and_centroids()
-        overwrites the calculate_area_and_centroids() method of PeakFit
+    ICR : float
+        descr
+    uICR : float
+        descr
+    two_tau : float
+        descr
+    utwo_tau : float
+        descr
+
+    Return
+    ------
+    pileup_correction : float
+        pileup_correction
+    pileup_correction_unc : float
+        standard uncertainty of pileup_correction_unc
     """
-    def __init__(self, Region, cal_fwhm, **kwargs):
-        super().__init__(**kwargs)
-        self.name = 't-1PEAK (LS), BKG (ST)'
+    #np.exp(ICR * two_tau)
+    sc = np.array([(np.exp((ICR+uICR) * two_tau) - np.exp((ICR-uICR) * two_tau))/(2*uICR + 1E-24), (np.exp(ICR * (two_tau+utwo_tau)) - np.exp(ICR * (two_tau-utwo_tau)))/(2*utwo_tau + 1E-24)])
+    unc = np.array([uICR, utwo_tau])
 
-        _cd = self.settings['bound_peak']
-        _fd = self.settings['bound_fwhm']
+    return np.exp(ICR * two_tau), np.sqrt(np.sum(np.power(sc*unc, 2)))
 
-        FWHM1 = np.sqrt(Region.centroids[0] * cal_fwhm[0] + cal_fwhm[1])
-        self.P0 = [100, Region.centroids[0], FWHM1/FWHMSIG, 5, 0.1, 1, 1, 0.01]        
-        self.BOUNDS = ((5, Region.centroids[0] - FWHM1/_cd, FWHM1/(_fd*FWHMSIG), 2, 0, 0.5, 0.01, 0), (np.inf, Region.centroids[0] + FWHM1/_cd, FWHM1*_fd/FWHMSIG, np.inf, 2, 1000, np.inf, 1))
+def load_isotope_database(filename='isotope_database.xlsx', short=False):
+    """Recall database with information about relevant isotopes for calibration and other calculations
 
-    def _fit(self, x, *p):
-        A, mu, sigma, df, LStep, LScale, BKG, step = p
-        return (_student_fit(x, A, mu, sigma, df) + _leftskew(x, A, mu, sigma, LStep, LScale)) * self._PEAK[0] + (_CONST_BKG(BKG) + _STEP(x, A, mu, sigma, step)) * self._BACKGROUND
-        
-    def calculate_area_and_centroids(self, X):
-        uu = np.sqrt(np.diag(self.var_matrix))
-        peaks, ur_peaks = self._calculate_peak_area(X)
-        print('ANALYTIC', np.array([self.coeff[0]*(1 + self.coeff[4])], dtype=float), np.array([1], dtype=float))
-        print('NUMERIC', peaks, ur_peaks)
-        return np.array(self.coeff[1:2], dtype=float), np.array(uu[1:2], dtype=float), np.array(peaks, dtype=float), np.array(ur_peaks, dtype=float)
-
-
-class StudentFitBS_Step(PeakFit):
-    """Subclass of PeakFit
-    
-    Attributes
+    Parameters
     ----------
-    
-    Methods
-    -------
-    _fit()
-        overwrites the _fit() method of PeakFit
-    calculate_area_and_centroids()
-        overwrites the calculate_area_and_centroids() method of PeakFit
+    filename : str
+        excel file containing the relevant information (default 'isotope_database.xlsx')
+    short : bool
+        return a condensed version of the dataframe with only isotope name and energy (default False)
+
+    Return
+    ------
+    df : pd.DataFrame
+        database with isotope information
     """
-    def __init__(self, Region, cal_fwhm, **kwargs):
-        super().__init__(**kwargs)
-        self.name = 't-1PEAK (LS RS), BKG (ST)'
+    df = pd.read_excel(filename, sheet_name=0, header=0, names=('isotope', 'energy / keV', 'lambda / s', 'u_lambda / s', 'reference lambda', 'yield / 1', 'u_yield / 1', 'reference yield'))
 
-        _cd = self.settings['bound_peak']
-        _fd = self.settings['bound_fwhm']
+    if short:
+        return df[['isotope', 'energy / keV']]
 
-        FWHM1 = np.sqrt(Region.centroids[0] * cal_fwhm[0] + cal_fwhm[1])
-        self.P0 = [100, Region.centroids[0], FWHM1/FWHMSIG, 5, 0.1, 1, 0.1, 1, 1, 0.01]        
-        self.BOUNDS = ((5, Region.centroids[0] - FWHM1/_cd, FWHM1/(_fd*FWHMSIG), 2, 0, 0.5, 0, 0.5, 0.01, 0), (np.inf, Region.centroids[0] + FWHM1/_cd, FWHM1*_fd/FWHMSIG, np.inf, 2, 1000, 2, 1000, np.inf, 1))
+    return df
 
-    def _fit(self, x, *p):
-        A, mu, sigma, df, LStep, LScale, RStep, RScale, BKG, step = p
-        return (_student_fit(x, A, mu, sigma, df) + _leftskew(x, A, mu, sigma, LStep, LScale) + _rightskew(x, A, mu, sigma, RStep, RScale)) * self._PEAK[0] + (_CONST_BKG(BKG) + _STEP(x, A, mu, sigma, step)) * self._BACKGROUND
-        
-    def calculate_area_and_centroids(self, X):
-        uu = np.sqrt(np.diag(self.var_matrix))
-        peaks, ur_peaks = self._calculate_peak_area(X)
-        return np.array(self.coeff[1:2], dtype=float), np.array(uu[1:2], dtype=float), np.array(peaks, dtype=float), np.array(ur_peaks, dtype=float)
+def _update_activities(sdb):
+    #check halflives
+    _filnan = sdb['l / s-1'].isna()
+    if np.sum(_filnan) > 0:
+        idb = load_isotope_database()
 
+        lbds, ulbds = [], []
 
-class Region:
-    """Class identifying a region of counts on the spectrum where it is suspected to be a peak
-    
-    Attributes
-    ----------
-    self.low_limit : int
-        descr
-    self.high_limit : int
-        descr
-    self.centroids : list
-        descr
-    self._fits : list
-        descr
-    #self.checks : dict
-    #    descr
-    #self.peak_kwargs : dict
-    #    descr
-    self.fit : PeakFit (or None)
-        descr
-    
-    Methods
-    -------
-    _select_fit()
-        descr
-    peak_elaboration()
-        descr
-    """
-    def __init__(self, low_limit, high_limit, centrs, min_netarea=100, max_allowed_unc=40, max_allowed_centroid_unc=2, max_allowed_chisq=5, left_skew=True, right_skew=True, slope=True, step=True):
-        self.low_limit = low_limit
-        self.high_limit = high_limit
-        self.centroids = centrs
-        self._fits = []
-        self.checks = {'min_netarea':min_netarea, 'max_allowed_unc':max_allowed_unc, 'max_allowed_centroid_unc':max_allowed_centroid_unc, 'max_allowed_chisq':max_allowed_chisq}
-        self.peak_kwargs = {'left_skew':left_skew, 'right_skew':right_skew, 'slope':slope, 'step':step}
-        self.fit = self._select_fit()
-        
-    def _select_fit(self, idx=0):
-        """Return important information about the spectrum
-    
-        Parameters
-        ----------
-        idx : int
-            index within self._fits (default 0, meaning the best fit since items within self._fits are ordered from best to worst)
-        
-        Return
-        ------
-        selected_fit : PeakFit (or None)
-            fit corresponding at index idx within self._fits
-        """
-        try:
-            return self._fits[idx]
-        except IndexError:
-            return None
-        
-    async def peak_elaboration(self, counts, cal_fwhm):
-        """Perform peak fitting coroutine within the region updating objects self._fits and self.fit
-    
-        Parameters
-        ----------
-        counts : np.array
-            descr
-        cal_fwhm : np.array
-            descr
-        
-        Return
-        ------
-        None
-        """
-        lgt = len(self._fits)
-        for _ in range(lgt):
-            self._fits.pop(0)
+        for item in sdb['isotope']:
+            _filter = idb['isotope'] == item
+            try:
+                lbd = idb[_filter].loc[idb[_filter].index[0], 'lambda / s']
+                ulbd = idb[_filter].loc[idb[_filter].index[0], 'u_lambda / s']
+            except IndexError:
+                lbd, ulbd = np.nan, np.nan
+            lbds.append(lbd)
+            ulbds.append(ulbd)
+        lbds = np.array(lbds, dtype=float)
+        ulbds = np.array(ulbds, dtype=float)
+        sdb['l / s-1'] = lbds
+        sdb['ul / s-1'] = ulbds
 
-        fit_functions_single = (StudentFit(self, cal_fwhm), StudentFit_Step(self, cal_fwhm), StudentFitRS_Step(self, cal_fwhm), StudentFitLS_Step(self, cal_fwhm), StudentFitBS_Step(self, cal_fwhm))
-        X = np.arange(self.low_limit, self.high_limit+1)
-        Y = counts[X]
-        
-        if len(self.centroids) == 1:
-            fit_functions = fit_functions_single
-        
-        else:
-            fit_functions = ()
-        
-        async with asyncio.TaskGroup() as taskgroup:
-            collect = [taskgroup.create_task(_fit.coro_evaluate(X, Y)) for _fit in fit_functions]
-        collect = [task.result() for task in collect]
-        #filter
-        self._fits = sorted([item for item in collect if item.intmsg == 0], key=lambda x : np.abs(x.chisq - 1))
-        self.fit = self._select_fit()
+    #update activities
+    sdb['curr date'] = datetime.datetime.today()
+    td = sdb['curr date'] - sdb['ref date']
+    td = td.dt.total_seconds()
+    sdb['curr A / Bq'] = sdb['A / Bq'] * np.exp(-sdb['l / s-1'] * td)
 
+    cs1 = np.exp(-sdb['l / s-1'] * td)
+    cs2 = -td * np.exp(-sdb['l / s-1'] * td)
+    cs3 = -sdb['l / s-1'] * np.exp(-sdb['l / s-1'] * td)
 
-class Elaboration:
-    """Class for spectrum elaboration
-    
-    Attributes
-    ----------
-    self.spectrum_name : str
-        descr
-    self.spectrum_profile : np.array
-        descr
-    self.calname : str
-        descr
-    self.cal_energy : np.array
-        descr
-    self.cal_fwhm : np.array
-        descr
-    self.K : float
-        descr
-    self.regions : list
-        descr
-    
-    Methods
-    -------
-    _get_spectrum_information()
-        descr
-    _get_calibration_information()
-        descr
-    """
-    def __init__(self, spectrum, calibration, K=3.5):
-        self.spectrum_name, self.spectrum_profile = self._get_spectrum_information(spectrum)
-        self.calname, self.cal_energy, self.cal_fwhm = self._get_calibration_information(calibration)
-        self.K = K
-        self.regions = []
+    udt = sdb['A / Bq'] * 0 + 60
 
-        if self.spectrum_profile is None:
-            raise ValueError
-            
-    def _get_spectrum_information(self, spectrum):
-        """Return important information about the spectrum
-    
-        Parameters
-        ----------
-        spectrum : str (path)
-            name of the gamma spectrum in list mode file
-        
-        Return
-        ------
-        filename : str
-            file path of the spectrum
-        counts : np.array
-            array of counts of the spectrum
-        """
-        return spectrum.filename(), spectrum.counts
-        
-    def _get_calibration_information(self, calibration):
-        """Return important information about the calibration
-    
-        Parameters
-        ----------
-        calibration : str (path)
-            name of the gamma spectrum in list mode file
-        
-        Return
-        ------
-        name : str
-            file path of the calibration
-        energy_parameters : np.array
-            2-float array of coefficients for energy parameters
-        fwhm_parameters : np.array
-            2-float array of coefficients for fwhm parameters
-        """
-        return calibration.name, calibration.energy_params, calibration.fwhm_params
-            
-    #####CONTINUE
-    
-def mcmc_peak_search(counts, step=100, iterations=50000):
-    chain = []
-    
-    secdif = aip.second_diff(counts, 1, 5)
-    sd_secdif = aip.standard_dev_S(counts, 1, 5)
-    
-    filt = (secdif < 0) & (np.abs(secdif) > 2 * sd_secdif)
-    current = np.arange(0,len(counts))[filt]
-    print(current)
-    
-    counts = counts + 1
-    #current = np.arange(0 + step, len(counts), step)
-    #current = np.random.randint(0, len(counts), size=int(len(counts)/100))
-    #initial = current
-    #ame_state = 0
-    plt.plot(current, np.zeros(len(current)), 'ko')
-    for _ in range(iterations):
-        # Propose a new sample
-        #proposal = np.random.normal(current, 1).astype(int)
-        proposal = np.random.uniform(low=current - 1, high=current + 2).astype(int)
-        #proposal = int(np.random.uniform(low=current - 1, high=current + 2))
-        proposal = np.where(proposal < 0, 0, proposal)
-        proposal = np.where(proposal >= len(counts), len(counts)-1, proposal)
-        #if proposal < 0:
-        #    proposal = 0
-        #elif proposal > len(counts):
-        #    proposal = len(counts)
+    pw1 = np.power(cs1 * sdb['uA / Bq'], 2)
+    pw2 = np.power(cs2 * sdb['ul / s-1'], 2)
+    pw3 = np.power(cs3 * udt, 2)
+    sdb['curr uA / Bq'] = np.sqrt(pw1 + pw2 + pw3)
 
-        # Acceptance probability
-        acceptance_ratio = counts[proposal] / counts[current]
+    return sdb
 
-        # Accept or reject the proposal
-        acceptance_value = np.random.rand(len(acceptance_ratio))#len(acceptance_ratio))
-        current = np.where(acceptance_value < acceptance_ratio, proposal, current)
-        #if acceptance_value < acceptance_ratio:
-        #    current = proposal
+def load_source_database(filename='Activity_table.pac'):
+    with open(filename, 'rb') as idb:
+        sdb = pickle.load(idb)
 
-        #chain.append(current)
-        #plt.plot(current, [_]*len(current), 'r-')
+    sdb = _update_activities(sdb)
 
-    #print(current, initial, current - initial)
-    plt.plot(current, np.ones(len(current)), 'ro')
-    plt.show()
-        
-    return current
+    return sdb
     
 if __name__ == '__main__':
-    #ccdf = gspec.ElaborationSpectrum('H:/code/gamma/elaboration/SDataR_Ho-166m_IRA_1_UG_2026-01-08_2026-02-25 12_14_27_EDT_25.asc', gspec.Calibration(), K=10)
     pass
-    #peaks = mcmc_peak_search(ccdf.counts)
-    #peaks = sorted(set(peaks))
-    #print(len(peaks))
-    #plt.plot(ccdf.counts, 'k-')
-    #plt.plot(peaks, ccdf.counts[peaks], 'ro')
-    #plt.show()
-    
-    #css = ccdf._centroid_search([184])
-    #ccdf.elaboration._add_region(css)
-    #ccdf.elaboration.regions[0].elaboration_fit(ccdf.counts, Calibration().fwhm_params)
-    """
-    reg = Region(6950, 7125, [7040])
-    asyncio.run(reg.peak_elaboration(ccdf.counts, ccdf.elaboration.cal_fwhm))
-    print(reg.fit)
-    if reg.fit is not None:
-        fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, sharex=True, height_ratios=[2,1])
-        
-        xplot = np.arange(reg.low_limit, reg.high_limit+1)
-        ax1.bar(xplot, ccdf.counts[xplot], width=1, align='edge', alpha=0.6)
-        xfit = np.linspace(np.min(xplot), np.max(xplot), 500)
-        yfit = reg.fit._draw_total(xfit)
-        ybkg = reg.fit._draw_background(xfit)
-        ax1.plot(xfit, yfit, 'r-')
-        ax1.plot(xfit, ybkg, 'k-')
-        res = (ccdf.counts[xplot] - reg.fit._draw_total(xplot)) / np.sqrt(ccdf.counts[xplot])
-        ax2.plot(xplot, res, 'r-o')
-        
-        ax1.set_xlim(np.min(xplot), np.max(xplot))
-        ax1.set_ylim(1E3, None)
-        ax1.set_yscale('log')
-        
-        fig.tight_layout()
-        plt.show()"""
