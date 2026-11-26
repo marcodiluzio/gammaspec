@@ -11,6 +11,8 @@ it's possible to open and parse csv LIST MODE files by executing:
 
 ```python
 import spectra
+import GUI_support #for GUI help during setting selection
+import peaks       #for peak elaboration
 
 #settings
 CHUNKSIZE = 50000         # size of every chunk in lines
@@ -20,14 +22,12 @@ LossFreeCounts = False    # whether to perform a Loss-Free Counts correction at 
 verbose = True            # whether to be verbose during elaboration of each chunk
 full_output = True        # whether to return an additional csv output with comprehensive information of every chunk
 
-#elaboration on a single file
-filename = 'C:/.../gamma/SDataR_Ho-166m_IRA_1_UG_2026-01-08.csv'
-spectra.spectrum_multielab(filename, EXTENDED_DEADTIMES, N_CHANNELS, chunksize=CHUNKSIZE, verbose=verbose, LFC=LossFreeCounts, folder='C:/.../gamma/elaboration', full_output=full_output)
+spectrum_object = spectra.open_digitized_spectrumPHA(filename, EXTENDED_DEADTIMES, N_CHANNELS, chunksize=CHUNKSIZE, verbose=verbose, LFC=LossFreeCounts, folder='C:/.../gamma/elaboration', full_output=full_output)
 
-#multiple files at once
-data_folder = 'C:/.../gamma'
-filenames = spectra.get_spectra_filenames(data_folder)
-spectra.multi_spectrum_elab(filenames, EXTENDED_DEADTIMES, N_CHANNELS, chunksize=CHUNKSIZE, verbose=verbose, LFC=LossFreeCounts, folder=os.path.join(data_folder, 'elaboration'), full_output=full_output)
-```
+#OR with GUI_support
+kw = GUI_support.get_options()
 
-these functions return an elaborated spectrum in asc format containing the counts array and information about counting times
+spectrum_object = spectra.open_digitized_spectrumPHA(**kw)
+
+
+#multiple elaboration are possible, explore methods within spectra
