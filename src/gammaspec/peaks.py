@@ -557,7 +557,7 @@ def _peak_integral(spectrum, cond_ROI, cond_BKG_CH):
         uncertainty of net peak area
     """
     bkg_left = spectrum.defined_spectrum_integral(start=cond_ROI[0], end=cond_ROI[0]+cond_BKG_CH[0]) / cond_BKG_CH[0]
-    bkg_right = spectrum.defined_spectrum_integral(start=cond_ROI[1], end=cond_ROI[1]-cond_BKG_CH[1]) / cond_BKG_CH[1]
+    bkg_right = spectrum.defined_spectrum_integral(start=cond_ROI[1]-cond_BKG_CH[1], end=cond_ROI[1]) / cond_BKG_CH[1]
     N = cond_ROI[1]-cond_BKG_CH[1] - (cond_ROI[0]+cond_BKG_CH[0])
     g_peak = spectrum.defined_spectrum_integral(start=cond_ROI[0]+cond_BKG_CH[0], end=cond_ROI[1]-cond_BKG_CH[1])
     c_peak = g_peak - np.average([bkg_left, bkg_right]) * N
