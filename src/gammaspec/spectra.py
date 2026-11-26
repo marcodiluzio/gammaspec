@@ -1274,7 +1274,7 @@ def retrieve_date(filename):
         isodate = header.readline().strip()
     if isodate[0] == '#':
         try:
-            return datetime.fromisoformat(isodate[1:])
+            return datetime.datetime.fromisoformat(isodate[1:])
         except Exception:
             return None
     return None
