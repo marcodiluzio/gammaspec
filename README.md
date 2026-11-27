@@ -21,7 +21,7 @@ N_CHANNELS = 16384        # number of channel of the resulting spectrum
 LossFreeCounts = False    # whether to perform a Loss-Free Counts correction at every chunk
 verbose = True            # whether to be verbose during elaboration of each chunk
 
-spectrum_object = spectra.open_digitized_spectrumPHA(filename, EXTENDED_DEADTIMES, N_CHANNELS, chunksize=CHUNKSIZE, verbose=verbose, LFC=LossFreeCounts, folder='C:/.../gamma/elaboration', full_output=full_output)
+spectrum_object = spectra.open_digitized_spectrumPHA(filename, EXTENDED_DEADTIMES, spectrum_channels=N_CHANNELS, chunksize=CHUNKSIZE, verbose=verbose, LFC=LossFreeCounts, folder='C:/.../gamma/elaboration', full_output=full_output)
 
 #OR with GUI_support
 kw = GUI_support.get_options()
@@ -37,7 +37,7 @@ ADC_conv = 32             # conversion factor for charges to channels
 LossFreeCounts = False    # whether to perform a Loss-Free Counts correction at every chunk
 verbose = True            # whether to be verbose during elaboration of each chunk
 
-spectrum_object = spectra.open_digitized_spectrumFPGA(filename, EXTENDED_DEADTIMES, N_CHANNELS, chunksize=CHUNKSIZE, ADC_conv=ADC_conv, verbose=verbose, LFC=LossFreeCounts, folder='C:/.../gamma/elaboration', full_output=full_output)
+spectrum_object = spectra.open_digitized_spectrumFPGA(filename, EXTENDED_DEADTIMES, spectrum_channels=N_CHANNELS, chunksize=CHUNKSIZE, ADC_conv=ADC_conv, verbose=verbose, LFC=LossFreeCounts, folder='C:/.../gamma/elaboration', full_output=full_output)
 
 
 #multiple elaboration are possible, explore methods within spectra
